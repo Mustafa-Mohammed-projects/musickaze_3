@@ -1,0 +1,97 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+
+    # Secrets are passed as environment variables (never pasted into the shell
+    # script), so passwords with special characters cannot break the commands.
+    env:
+      KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+      KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+      KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+      KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Check project files
+        run: |
+          for f in main.py service.py audio_backend.py cover_art.py storage.py arabic_text.py buildozer.spec \
+                   icon.png presplash.png fonts/DejaVuSans.ttf fonts/DejaVuSans-Bold.ttf; do
+            if [ ! -f "$f" ]; then echo "::error::Missing required file: $f"; exit 1; fi
+          done
+          python -m py_compile main.py service.py audio_backend.py cover_art.py storage.py arabic_text.py
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential ccache git zip unzip openjdk-17-jdk autoconf libtool pkg-config \
+            zlib1g-dev libncurses5-dev cmake libffi-dev libssl-dev
+
+      - name: Cache Buildozer / Android SDK / NDK
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.buildozer
+            .buildozer
+          key: buildozer-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}
+          restore-keys: |
+            buildozer-${{ runner.os }}-
+
+      - name: Install buildozer and cython (pinned)
+        run: |
+          pip install --upgrade pip
+          pip install buildozer==1.5.0 cython==0.29.33
+
+      - name: Choose build type
+        id: mode
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "release=true" >> "$GITHUB_OUTPUT"
+            echo "Signing secrets found -> building a signed RELEASE apk"
+          else
+            echo "release=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::No signing secrets found -> building a DEBUG apk instead"
+          fi
+
+      - name: Build signed release APK
+        if: steps.mode.outputs.release == 'true'
+        run: |
+          echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/kazemusic-release.keystore"
+          export P4A_RELEASE_KEYSTORE="$RUNNER_TEMP/kazemusic-release.keystore"
+          export P4A_RELEASE_KEYSTORE_PASSWD="$KEYSTORE_PASSWORD"
+          export P4A_RELEASE_KEYALIAS="$KEY_ALIAS"
+          export P4A_RELEASE_KEYALIAS_PASSWD="$KEY_PASSWORD"
+          buildozer -v android release
+
+      - name: Build debug APK (no signing secrets)
+        if: steps.mode.outputs.release != 'true'
+        run: buildozer -v android debug
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kazemusic-apk
+          path: bin/*.apk
+          if-no-files-found: error
+
+      - name: Clean up keystore
+        if: always()
+        run: rm -f "$RUNNER_TEMP/kazemusic-release.keystore"
