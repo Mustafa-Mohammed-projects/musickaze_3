@@ -26,7 +26,7 @@ fullscreen = 0
 
 icon.filename = %(source.dir)s/icon.png
 presplash.filename = %(source.dir)s/presplash.png
-android.presplash_color = #0E0E13
+#android.presplash_color = #0E0E13
 
 # Android 13+ uses READ_MEDIA_AUDIO, older versions use READ_EXTERNAL_STORAGE.
 # WAKE_LOCK keeps the music playing when the screen turns off,
@@ -40,6 +40,10 @@ android.enable_androidx = True
 android.archs = arm64-v8a
 android.accept_sdk_license = True
 
+android.keystore = 
+android.keystore_passwd = 
+android.keyalias = 
+android.keyalias_passwd = 
 android.release_artifact = apk
 # Signing: the workflow passes the keystore through P4A_RELEASE_* environment
 # variables, so the android.keystore* fields must stay unset here.
