@@ -13,7 +13,7 @@ Both classes offer the same interface to main.py:
 
     set_queue_and_play(songs, index)   toggle()   next()   prev()   seek_to(sec)
     current_song  current_index  cover_path  is_playing()  get_position()  get_duration()
-    sync()  start()  close()
+    sync()  start()  close()  poll()
     callbacks (may be called from ANY thread):  on_change()   on_error(message)
 """
 
@@ -27,6 +27,7 @@ from kivy.clock import Clock
 
 from arabic_text import fix_mojibake, search_key
 from cover_art import CoverLoader
+import ipc
 
 UNKNOWN_ARTIST = 'Unknown artist'
 UNKNOWN_TITLE = 'Unknown title'
@@ -74,23 +75,40 @@ class PlayerBase:
     def sync(self):
         self._changed()
 
+    def poll(self):
+        pass
+
+    def quit(self):
+        self.close()
+
     def close(self):
         pass
 
 
 # ======================================================================
-# Android: talks to the foreground service
+# Android: talks to the playback engine (foreground service)
 # ======================================================================
 class ServiceClient(PlayerBase):
-    SERVICE_NAME = 'Music'            # must match "services = Music:service.py" in buildozer.spec
+    SERVICE_NAME = 'Music'            # must match "services = Music:music_service.py" in buildozer.spec
+    ACK_TIMEOUT_START = 7.0           # seconds the service gets to start and answer
+    ACK_TIMEOUT = 4.0                 # seconds a normal command may take
+    STALE_MS = 6000                   # a state older than this comes from a dead engine
 
     def __init__(self, data_dir):
         super().__init__()
+        self.data_dir = data_dir
         self.queue_path = os.path.join(data_dir, 'playback_queue.json')
-        self.boot_path = os.path.join(data_dir, 'service_boot.json')
         self._qkey = None
         self._seq = 0
+        self._target = 'service'              # 'service', or 'embedded' after a fallback
+        self._embedded = None
         self._receiver = None
+        self._state_mtime = 0.0
+        self._last_ts = 0
+        self._ack_seq = 0
+        self._last_error_id = None
+        self._waiting = None                  # (seq, deadline, command) of an unanswered command
+        self._last_load = None                # last LOAD_PLAY command, replayed after a fallback
         self._playing = False
         self._pos_ms = 0.0
         self._dur_ms = 0.0
@@ -98,14 +116,14 @@ class ServiceClient(PlayerBase):
 
     # ---------------- lifecycle ----------------
     def start(self):
-        """Listen to the service's state broadcasts and ask for the current state."""
         try:
             from android.broadcast import BroadcastReceiver
             pkg = get_android_activity().getPackageName()
             self._receiver = BroadcastReceiver(self._on_state_broadcast, actions=[pkg + '.STATE'])
             self._receiver.start()
         except Exception as e:
-            print('Could not listen to the playback service:', e)
+            ipc.log(self.data_dir, 'app', 'state receiver failed (file polling still works):', e)
+        self.poll()
         self.sync()
 
     def close(self):
@@ -116,44 +134,51 @@ class ServiceClient(PlayerBase):
         except Exception:
             pass
         self._receiver = None
+        if self._embedded is not None:               # embedded music cannot outlive the app
+            self._embedded.events.put(('cmd', {'cmd': 'QUIT'}))
 
     def sync(self):
-        self._send({'cmd': 'SYNC'})
+        self._send({'cmd': 'SYNC'}, track=False)
+        self.poll()
+
+    def quit(self):
+        """Stop the music for good: the service shuts down and removes its notification."""
+        self._send({'cmd': 'QUIT'}, track=False)
+        self.close()
 
     # ---------------- sending commands ----------------
-    def _next_seq(self):
+    def _send(self, command, track=True):
+        """Writes the command file (primary) and sends a broadcast (fast path)."""
         self._seq = max(self._seq + 1, int(time.time() * 1000))
-        return self._seq
-
-    def _send(self, command):
+        command = dict(command, seq=self._seq, target=self._target)
+        try:
+            ipc.send_command(self.data_dir, command)
+        except Exception as e:
+            ipc.log(self.data_dir, 'app', 'could not write command file:', e)
         try:
             from jnius import autoclass
             activity = get_android_activity()
-            pkg = activity.getPackageName()
             Intent = autoclass('android.content.Intent')
-            intent = Intent(pkg + '.CMD')
-            intent.setPackage(pkg)
+            intent = Intent(activity.getPackageName() + '.CMD')
+            intent.setPackage(activity.getPackageName())
             for key, value in command.items():
                 intent.putExtra(key, str(value))
             activity.sendBroadcast(intent)
         except Exception as e:
-            print('Could not send a command to the service:', e)
+            ipc.log(self.data_dir, 'app', 'broadcast failed (file channel still works):', e)
+        if track and self.current_song is not None and self._waiting is None:
+            timeout = self.ACK_TIMEOUT_START if command.get('cmd') == 'LOAD_PLAY' else self.ACK_TIMEOUT
+            self._waiting = (self._seq, time.time() + timeout, command)
+        return self._seq
 
-    def _start_service(self, boot_command):
+    def _start_service(self):
         from jnius import autoclass
         activity = get_android_activity()
-        pkg = activity.getPackageName()
-        # The first command is also stored in a file: the service reads it as
-        # soon as it is ready, so it cannot be lost during startup.
-        tmp = self.boot_path + '.tmp'
-        with open(tmp, 'w', encoding='utf-8') as f:
-            json.dump(boot_command, f)
-        os.replace(tmp, self.boot_path)
-        Service = autoclass('{}.Service{}'.format(pkg, self.SERVICE_NAME))
+        Service = autoclass('{}.Service{}'.format(activity.getPackageName(), self.SERVICE_NAME))
         try:
-            Service.start(activity, self.boot_path)
+            Service.start(activity, self.data_dir)
         except Exception:
-            Service.start(activity, '', 'KazeMusic', 'Playing music', self.boot_path)
+            Service.start(activity, '', 'KazeMusic', 'Playing music', self.data_dir)
 
     # ---------------- queue ----------------
     def set_queue_and_play(self, songs, index):
@@ -163,17 +188,11 @@ class ServiceClient(PlayerBase):
         if key != self._qkey:
             slim = [{k: s.get(k) for k in ('id', 'title', 'artist', 'album', 'album_id', 'duration', 'uri')}
                     for s in songs]
-            tmp = self.queue_path + '.tmp'
-            with open(tmp, 'w', encoding='utf-8') as f:
-                json.dump({'songs': slim}, f, ensure_ascii=False)
-            os.replace(tmp, self.queue_path)
+            ipc.write_json_atomic(self.queue_path, {'songs': slim})
             self._qkey = key
 
-        command = {'cmd': 'LOAD_PLAY', 'qpath': self.queue_path, 'qkey': key,
-                   'index': index, 'seq': self._next_seq()}
-
-        # show something immediately; the service confirms a moment later
         song = songs[index]
+        # show something immediately; the engine confirms a moment later
         self.current_song = {'id': song['id'], 'title': song['title'], 'artist': song['artist'],
                              'album': song.get('album', ''), 'duration': song.get('duration') or 0}
         self.current_index = index
@@ -182,14 +201,18 @@ class ServiceClient(PlayerBase):
         self._pos_ms = 0.0
         self._dur_ms = (song.get('duration') or 0) * 1000.0
         self._ts_ms = time.time() * 1000
+        self._waiting = None
         self._changed()
 
-        try:
-            self._start_service(command)
-        except Exception as e:
-            self._error('Could not start the playback service: {}'.format(e))
-            return
-        self._send(command)
+        command = {'cmd': 'LOAD_PLAY', 'qpath': self.queue_path, 'qkey': key, 'index': index}
+        self._last_load = command
+        self._send(command)                  # the command file exists BEFORE the service starts
+        if self._target == 'service':
+            try:
+                self._start_service()
+            except Exception as e:
+                ipc.log(self.data_dir, 'app', 'service start failed:', e)
+                self._fallback('The playback service could not be started: {}'.format(e))
 
     def toggle(self):
         if self.current_song:
@@ -230,38 +253,105 @@ class ServiceClient(PlayerBase):
         duration = self.get_duration()
         return min(pos, duration) if duration > 0 else pos
 
+    def poll(self):
+        """Called by the app every few hundred ms: reads the state file and
+        checks that the engine answers."""
+        try:
+            path = ipc.state_path(self.data_dir)
+            mtime = os.path.getmtime(path)
+            if mtime != self._state_mtime:
+                self._state_mtime = mtime
+                state = ipc.read_state(self.data_dir)
+                if state:
+                    self._apply_state(state, source='file')
+        except OSError:
+            pass
+        waiting = self._waiting
+        if waiting and self._target == 'service':
+            seq, deadline, command = waiting
+            if self._ack_seq >= seq:
+                self._waiting = None
+            elif time.time() > deadline:
+                self._waiting = None
+                self._fallback('The playback service did not answer.')
+
     def _on_state_broadcast(self, context, intent):
         """Runs on an Android thread (not the Kivy thread)."""
         try:
-            def get(key, default=''):
+            state = {}
+            for key in ('role', 'song_id', 'title', 'artist', 'album', 'duration', 'index', 'playing',
+                        'pos_ms', 'dur_ms', 'ts', 'cover', 'error', 'error_id', 'ack_seq'):
                 value = intent.getStringExtra(key)
-                return default if value is None else str(value)
-
-            def number(key):
-                try:
-                    return float(get(key, '0') or 0)
-                except ValueError:
-                    return 0.0
-
-            song_id = get('song_id')
-            if song_id:
-                self.current_song = {'id': song_id, 'title': get('title'), 'artist': get('artist'),
-                                     'album': get('album'), 'duration': number('duration')}
-            else:
-                self.current_song = None
-            self.current_index = int(number('index')) if song_id else -1
-            self._playing = get('playing') == '1'
-            self._pos_ms = number('pos_ms')
-            self._dur_ms = number('dur_ms')
-            self._ts_ms = number('ts') or time.time() * 1000
-            self.cover_path = get('cover') or None
-            error = get('error')
+                state[key] = '' if value is None else str(value)
+            self._apply_state(state, source='broadcast')
         except Exception as e:
             print('Bad state from the service:', e)
-            return
+
+    def _apply_state(self, st, source):
+        def number(key):
+            try:
+                return float(st.get(key) or 0)
+            except (TypeError, ValueError):
+                return 0.0
+
+        if st.get('role') != self._target:
+            return                                    # a state from the other engine
+        ts = number('ts')
+        if ts < self._last_ts:
+            return                                    # older than what we already know
+        if abs(time.time() * 1000 - ts) > self.STALE_MS and source == 'file':
+            return                                    # left over from a dead engine
+        self._last_ts = ts
+        self._ack_seq = max(self._ack_seq, int(number('ack_seq')))
+        if self._waiting and number('ack_seq') < self._waiting[0]:
+            return                                    # engine has not seen our last command yet:
+                                                      # keep the optimistic state
+
+        song_id = str(st.get('song_id') or '')
+        if song_id:
+            self.current_song = {'id': song_id, 'title': st.get('title', ''), 'artist': st.get('artist', ''),
+                                 'album': st.get('album', ''), 'duration': number('duration')}
+            self.current_index = int(number('index'))
+        else:
+            self.current_song = None
+            self.current_index = -1
+        self._playing = str(st.get('playing')) == '1'
+        self._pos_ms = number('pos_ms')
+        self._dur_ms = number('dur_ms')
+        self._ts_ms = ts or time.time() * 1000
+        self.cover_path = st.get('cover') or None
+        error, error_id = st.get('error'), st.get('error_id')
         self._changed()
-        if error:
+        if self._last_error_id is None:
+            self._last_error_id = error_id            # first state: don't replay an old error
+        elif error and error_id != self._last_error_id:
+            self._last_error_id = error_id
             self._error(error)
+
+    # ---------------- fallback ----------------
+    def _fallback(self, reason):
+        """The service does not work: run the same engine inside the app."""
+        if self._target == 'embedded':
+            return
+        tail = ipc.tail_log(self.data_dir, 20)
+        ipc.log(self.data_dir, 'app', 'FALLBACK to the embedded engine:', reason)
+        self._send({'cmd': 'QUIT'}, track=False)       # in case the service wakes up later
+        self._target = 'embedded'
+        self._last_ts = 0
+        self._ack_seq = 0
+        try:
+            from engine import Engine
+            import threading
+            self._embedded = Engine(role='embedded', context=get_android_activity(), data_dir=self.data_dir)
+            threading.Thread(target=self._embedded.run, daemon=True).start()
+        except Exception as e:
+            ipc.log(self.data_dir, 'app', 'embedded engine failed:', e)
+            self._error('Playback failed: {}\n\n{}'.format(e, tail))
+            return
+        if self._last_load:
+            self._send(dict(self._last_load), track=False)
+        self._error('The background service did not start, so music plays inside the app only '
+                    '(it stops when you close the app).\n\nReason: {}\n\nLog:\n{}'.format(reason, tail))
 
 
 # ======================================================================

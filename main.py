@@ -26,6 +26,7 @@ from kivy.uix.popup import Popup
 from arabic_text import display, is_rtl, has_rtl, search_key
 from audio_backend import create_player, scan_device_library, get_android_activity
 from storage import Library
+import ipc
 
 # ============================================================
 # Fonts (needed for Arabic: Kivy's default Roboto has no Arabic letters)
@@ -441,6 +442,7 @@ class SongsScreen(ModernScreen):
         self.list_view = None
         self._search_event = None
         self.on_rescan = None
+        self.on_show_log = None
 
         self.main = BoxLayout(orientation='vertical', padding=[dp(20), dp(24), dp(20), dp(8)], spacing=dp(12))
 
@@ -450,6 +452,11 @@ class SongsScreen(ModernScreen):
                                          bg_color=SURFACE_COLOR, color=ACCENT_COLOR, radius=[dp(12)],
                                          size_hint=(None, None), size=(dp(84), dp(36)))
         rescan_btn.bind(on_release=lambda *_: self.on_rescan and self.on_rescan())
+        log_btn = CustomRoundedButton(text='Log', font_size=sp(13), bold=True,
+                                      bg_color=SURFACE_COLOR, color=TEXT_MUTED, radius=[dp(12)],
+                                      size_hint=(None, None), size=(dp(52), dp(36)))
+        log_btn.bind(on_release=lambda *_: self.on_show_log and self.on_show_log())
+        header_row.add_widget(log_btn)
         header_row.add_widget(rescan_btn)
         self.main.add_widget(header_row)
 
@@ -706,6 +713,7 @@ class NowPlayingScreen(ModernScreen):
         self.on_prev = None
         self.on_seek = None
         self.on_toggle_favorite = None
+        self.on_quit = None
         self._seeking = False
         self._seek_touch = None
 
@@ -769,6 +777,13 @@ class NowPlayingScreen(ModernScreen):
         controls_row.add_widget(self.btn_play)
         controls_row.add_widget(self.btn_next)
         root.add_widget(controls_row)
+
+        self.btn_quit = CustomRoundedButton(text='Stop music and exit', font_size=sp(12),
+                                            bg_color=(0, 0, 0, 0), pressed_color=SURFACE_COLOR,
+                                            color=TEXT_DIM, radius=[dp(12)],
+                                            size_hint_y=None, height=dp(34))
+        self.btn_quit.bind(on_release=lambda *_: self.on_quit and self.on_quit())
+        root.add_widget(self.btn_quit)
 
         self.add_widget(root)
 
@@ -855,6 +870,8 @@ class KazeMusicApp(App):
         self.songs_screen.setup(self._play_song_from_list, self._toggle_favorite,
                                 self._show_add_to_playlist, self.library_store.is_favorite)
         self.songs_screen.on_rescan = lambda: self._load_library(force=True)
+        self.songs_screen.on_show_log = self._show_log
+        self.player_screen.on_quit = self._quit_everything
         self.favorites_screen.setup(self._play_song_from_favorites, self._toggle_favorite,
                                     self._show_add_to_playlist, self.library_store.is_favorite)
         self.playlists_screen.set_create_callback(self._create_playlist)
@@ -987,6 +1004,34 @@ class KazeMusicApp(App):
         cancel.bind(on_release=lambda *_: popup.dismiss())
         card.add_widget(cancel)
         popup.open()
+
+    def _show_log(self):
+        """Last lines of the shared app/service log - useful when something misbehaves."""
+        text = ipc.tail_log(self.user_data_dir, 60)
+        popup, card = card_popup(height=Window.height * 0.75, size_hint_x=0.94)
+        card.add_widget(popup_title('Log'))
+        box = TextInput(text=text, readonly=True, multiline=True, font_size=sp(11),
+                        background_normal='', background_active='', background_color=SURFACE_HOVER,
+                        foreground_color=TEXT_MAIN, cursor_color=ACCENT_COLOR, padding=[dp(10), dp(10)])
+        card.add_widget(box)
+        close = CustomRoundedButton(text='Close', font_size=sp(14), bold=True, bg_color=SURFACE_HOVER,
+                                    color=TEXT_MAIN, radius=[dp(14)], size_hint_y=None, height=dp(44))
+        close.bind(on_release=lambda *_: popup.dismiss())
+        card.add_widget(close)
+        popup.open()
+
+        def _to_end(dt):
+            try:
+                lines = text.split('\n')
+                box.cursor = (len(lines[-1]), len(lines) - 1)
+            except Exception:
+                pass
+        Clock.schedule_once(_to_end, 0.15)
+
+    def _quit_everything(self):
+        """Stops the playback service (and its notification), then closes the app."""
+        self.player.quit()
+        Clock.schedule_once(lambda dt: self.stop(), 0.4)
 
     def _confirm_delete_playlist(self, name):
         popup, card = card_popup(height=dp(230))
@@ -1254,6 +1299,7 @@ class KazeMusicApp(App):
         self.player.seek_to(seconds)
 
     def _tick(self, dt):
+        self.player.poll()
         if self.player.current_song:
             try:
                 pos = self.player.get_position()
